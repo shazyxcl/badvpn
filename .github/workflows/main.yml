@@ -1,0 +1,372 @@
+name: Build tun2socks Android (.so) - 16KB Page Size
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  NDK_VERSION: "27.2.12479018"      # NDK r27 — supports 16KB page size via flags
+  API_LEVEL: "21"                    # minSdkVersion
+  # Arsitektur yang dibangun
+  ABIS: "arm64-v8a armeabi-v7a x86_64 x86"
+
+jobs:
+  build:
+    name: Build tun2socks [${{ matrix.abi }}]
+    runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        abi:
+          - arm64-v8a
+          - armeabi-v7a
+          - x86_64
+          - x86
+
+    steps:
+      # ─────────────────────────────────────────────
+      # 1. Checkout repo kamu (bukan badvpn langsung)
+      # ─────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ─────────────────────────────────────────────
+      # 2. Setup Java (dibutuhkan sdkmanager)
+      # ─────────────────────────────────────────────
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # ─────────────────────────────────────────────
+      # 3. Install Android NDK r27 via sdkmanager
+      # ─────────────────────────────────────────────
+      - name: Install Android NDK ${{ env.NDK_VERSION }}
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "ndk;${{ env.NDK_VERSION }}" \
+            --sdk_root=$ANDROID_HOME
+          echo "NDK_HOME=$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
+
+      # ─────────────────────────────────────────────
+      # 4. Install dependencies build
+      # ─────────────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake ninja-build python3 file
+
+      # ─────────────────────────────────────────────
+      # 5. Clone badvpn dari ambrop72
+      # ─────────────────────────────────────────────
+      - name: Clone badvpn source
+        run: |
+          git clone --depth=1 https://github.com/ambrop72/badvpn.git badvpn
+          echo "BADVPN_DIR=$GITHUB_WORKSPACE/badvpn" >> $GITHUB_ENV
+
+      # ─────────────────────────────────────────────
+      # 6. Patch CMakeLists: tambahkan add_library SHARED
+      #    badvpn aslinya hanya build executable, kita
+      #    tambahkan target shared library wrapper-nya.
+      # ─────────────────────────────────────────────
+      - name: Patch badvpn for shared library output
+        run: |
+          ABI="${{ matrix.abi }}"
+          BADVPN_DIR="${{ env.BADVPN_DIR }}"
+
+          # Tulis CMakeLists wrapper di root badvpn
+          cat > "$BADVPN_DIR/CMakeLists_shared_patch.cmake" << 'CMAKEPATCH'
+          # Patch: expose tun2socks sebagai shared library
+          # Dijalankan setelah cmake configure utama selesai
+          CMAKEPATCH
+
+          # Tulis wrapper CMakeLists.txt untuk build shared lib
+          mkdir -p "$BADVPN_DIR/tun2socks_jni"
+          cat > "$BADVPN_DIR/tun2socks_jni/CMakeLists.txt" << 'JNICMAKE'
+cmake_minimum_required(VERSION 3.10)
+project(tun2socks_jni C)
+
+# Path ke root badvpn (di-set dari parent)
+if(NOT DEFINED BADVPN_ROOT)
+    get_filename_component(BADVPN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+endif()
+
+# Include directories dari badvpn
+include_directories(
+    ${BADVPN_ROOT}
+    ${BADVPN_ROOT}/lwip/src/include
+    ${BADVPN_ROOT}/lwip/src/include/ipv4
+    ${BADVPN_ROOT}/lwip/src/include/ipv6
+    ${BADVPN_ROOT}/tun2socks
+)
+
+# Kumpulkan source yang diperlukan tun2socks
+set(TUN2SOCKS_SOURCES
+    ${BADVPN_ROOT}/tun2socks/tun2socks.c
+    ${BADVPN_ROOT}/tun2socks/SocksUdpGwClient.c
+    ${BADVPN_ROOT}/tun2socks/socksclient.c
+    ${BADVPN_ROOT}/udpgw_client/UdpGwClient.c
+)
+
+set(LWIP_SOURCES
+    ${BADVPN_ROOT}/lwip/src/core/def.c
+    ${BADVPN_ROOT}/lwip/src/core/dhcp.c
+    ${BADVPN_ROOT}/lwip/src/core/dns.c
+    ${BADVPN_ROOT}/lwip/src/core/inet_chksum.c
+    ${BADVPN_ROOT}/lwip/src/core/init.c
+    ${BADVPN_ROOT}/lwip/src/core/ip.c
+    ${BADVPN_ROOT}/lwip/src/core/mem.c
+    ${BADVPN_ROOT}/lwip/src/core/memp.c
+    ${BADVPN_ROOT}/lwip/src/core/netif.c
+    ${BADVPN_ROOT}/lwip/src/core/pbuf.c
+    ${BADVPN_ROOT}/lwip/src/core/raw.c
+    ${BADVPN_ROOT}/lwip/src/core/stats.c
+    ${BADVPN_ROOT}/lwip/src/core/sys.c
+    ${BADVPN_ROOT}/lwip/src/core/tcp.c
+    ${BADVPN_ROOT}/lwip/src/core/tcp_in.c
+    ${BADVPN_ROOT}/lwip/src/core/tcp_out.c
+    ${BADVPN_ROOT}/lwip/src/core/timeouts.c
+    ${BADVPN_ROOT}/lwip/src/core/udp.c
+    ${BADVPN_ROOT}/lwip/src/core/ipv4/autoip.c
+    ${BADVPN_ROOT}/lwip/src/core/ipv4/icmp.c
+    ${BADVPN_ROOT}/lwip/src/core/ipv4/igmp.c
+    ${BADVPN_ROOT}/lwip/src/core/ipv4/ip4.c
+    ${BADVPN_ROOT}/lwip/src/core/ipv4/ip4_addr.c
+    ${BADVPN_ROOT}/lwip/src/core/ipv4/ip4_frag.c
+    ${BADVPN_ROOT}/lwip/src/core/ipv6/ethip6.c
+    ${BADVPN_ROOT}/lwip/src/core/ipv6/icmp6.c
+    ${BADVPN_ROOT}/lwip/src/core/ipv6/inet6.c
+    ${BADVPN_ROOT}/lwip/src/core/ipv6/ip6.c
+    ${BADVPN_ROOT}/lwip/src/core/ipv6/ip6_addr.c
+    ${BADVPN_ROOT}/lwip/src/core/ipv6/ip6_frag.c
+    ${BADVPN_ROOT}/lwip/src/core/ipv6/mld6.c
+    ${BADVPN_ROOT}/lwip/src/core/ipv6/nd6.c
+    ${BADVPN_ROOT}/lwip/src/netif/ethernet.c
+)
+
+add_library(tun2socks SHARED
+    ${TUN2SOCKS_SOURCES}
+    ${LWIP_SOURCES}
+)
+
+# 16KB page size support — wajib untuk Android 15+
+# NDK r27: pakai flag manual; NDK r28+: pakai ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON
+target_link_options(tun2socks PRIVATE
+    -Wl,-z,max-page-size=16384
+    -Wl,-z,common-page-size=16384
+)
+
+target_compile_definitions(tun2socks PRIVATE
+    ANDROID
+    BADVPN_THREAD_SAFE=0
+    BADVPN_USE_EPOLL
+    BADVPN_LINUX
+)
+
+target_link_libraries(tun2socks
+    android
+    log
+)
+JNICMAKE
+          echo "JNI CMakeLists.txt ditulis."
+
+      # ─────────────────────────────────────────────
+      # 7. Configure CMake dengan NDK toolchain
+      # ─────────────────────────────────────────────
+      - name: Configure CMake [${{ matrix.abi }}]
+        run: |
+          ABI="${{ matrix.abi }}"
+          NDK_HOME="${{ env.NDK_HOME }}"
+          BADVPN_DIR="${{ env.BADVPN_DIR }}"
+          BUILD_DIR="$GITHUB_WORKSPACE/build/$ABI"
+
+          mkdir -p "$BUILD_DIR"
+
+          cmake \
+            -S "$BADVPN_DIR" \
+            -B "$BUILD_DIR" \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="$ABI" \
+            -DANDROID_PLATFORM="android-${{ env.API_LEVEL }}" \
+            -DANDROID_STL="c++_static" \
+            -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON \
+            -DBUILD_NOTHING_BY_DEFAULT=1 \
+            -DBUILD_TUN2SOCKS=1 \
+            -DBUILD_UDPGW=1 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384" \
+            -DCMAKE_EXE_LINKER_FLAGS="-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384" \
+            -DBADVPN_ROOT="$BADVPN_DIR"
+
+      # ─────────────────────────────────────────────
+      # 8. Build
+      # ─────────────────────────────────────────────
+      - name: Build [${{ matrix.abi }}]
+        run: |
+          ABI="${{ matrix.abi }}"
+          BUILD_DIR="$GITHUB_WORKSPACE/build/$ABI"
+          cmake --build "$BUILD_DIR" --config Release -- -j$(nproc)
+
+      # ─────────────────────────────────────────────
+      # 9. Build shared library (.so) via wrapper
+      # ─────────────────────────────────────────────
+      - name: Build tun2socks.so (shared library) [${{ matrix.abi }}]
+        run: |
+          ABI="${{ matrix.abi }}"
+          NDK_HOME="${{ env.NDK_HOME }}"
+          BADVPN_DIR="${{ env.BADVPN_DIR }}"
+          SO_BUILD_DIR="$GITHUB_WORKSPACE/build_so/$ABI"
+
+          mkdir -p "$SO_BUILD_DIR"
+
+          cmake \
+            -S "$BADVPN_DIR/tun2socks_jni" \
+            -B "$SO_BUILD_DIR" \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="$ABI" \
+            -DANDROID_PLATFORM="android-${{ env.API_LEVEL }}" \
+            -DANDROID_STL="c++_static" \
+            -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBADVPN_ROOT="$BADVPN_DIR" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384"
+
+          cmake --build "$SO_BUILD_DIR" --config Release -- -j$(nproc)
+
+      # ─────────────────────────────────────────────
+      # 10. Kumpulkan output & verifikasi 16KB alignment
+      # ─────────────────────────────────────────────
+      - name: Collect outputs & verify 16KB alignment [${{ matrix.abi }}]
+        run: |
+          ABI="${{ matrix.abi }}"
+          OUT_DIR="$GITHUB_WORKSPACE/output/jniLibs/$ABI"
+          BUILD_DIR="$GITHUB_WORKSPACE/build/$ABI"
+          SO_BUILD_DIR="$GITHUB_WORKSPACE/build_so/$ABI"
+
+          mkdir -p "$OUT_DIR"
+
+          # Salin executable (opsional, untuk debug server-side)
+          [ -f "$BUILD_DIR/tun2socks/badvpn-tun2socks" ] && \
+            cp "$BUILD_DIR/tun2socks/badvpn-tun2socks" "$OUT_DIR/"
+
+          [ -f "$BUILD_DIR/udpgw/badvpn-udpgw" ] && \
+            cp "$BUILD_DIR/udpgw/badvpn-udpgw" "$OUT_DIR/"
+
+          # Salin shared library
+          [ -f "$SO_BUILD_DIR/libtun2socks.so" ] && \
+            cp "$SO_BUILD_DIR/libtun2socks.so" "$OUT_DIR/"
+
+          echo "=== Files in output ==="
+          ls -lh "$OUT_DIR/"
+
+          # ── Verifikasi LOAD segment alignment ──
+          NDK_HOME="${{ env.NDK_HOME }}"
+          READELF="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+
+          for f in "$OUT_DIR"/*.so; do
+            [ -f "$f" ] || continue
+            echo ""
+            echo ">>> Verifikasi 16KB alignment: $(basename $f)"
+            "$READELF" -l "$f" | grep -E "LOAD|GNU_RELRO|Align"
+            ALIGN=$("$READELF" -l "$f" | grep "LOAD" | awk '{print $NF}' | head -1)
+            if [[ "$ALIGN" == "0x4000" ]] || [[ "$ALIGN" == "16384" ]]; then
+              echo "✅ PASS: LOAD segment aligned 16KB (0x4000)"
+            else
+              echo "⚠️  WARNING: Alignment = $ALIGN (expected 0x4000 untuk 16KB)"
+            fi
+          done
+
+          # file info
+          for f in "$OUT_DIR"/*; do
+            [ -f "$f" ] && file "$f" || true
+          done
+
+      # ─────────────────────────────────────────────
+      # 11. Upload artifact per ABI
+      # ─────────────────────────────────────────────
+      - name: Upload artifact [${{ matrix.abi }}]
+        uses: actions/upload-artifact@v4
+        with:
+          name: tun2socks-${{ matrix.abi }}
+          path: output/jniLibs/${{ matrix.abi }}/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────
+  # Job kedua: gabungkan semua ABI & buat release
+  # ─────────────────────────────────────────────────
+  package:
+    name: Package all ABIs & Release
+    runs-on: ubuntu-22.04
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all ABI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: jniLibs/
+          pattern: tun2socks-*
+          merge-multiple: false
+
+      - name: Reorganize folder structure
+        run: |
+          mkdir -p dist/jniLibs
+          for abi_dir in jniLibs/tun2socks-*/; do
+            abi=$(basename "$abi_dir" | sed 's/tun2socks-//')
+            mkdir -p "dist/jniLibs/$abi"
+            cp -r "$abi_dir"* "dist/jniLibs/$abi/" 2>/dev/null || true
+          done
+          echo "=== Final dist structure ==="
+          find dist/ -type f | sort
+
+      - name: Create zip archive
+        run: |
+          cd dist
+          zip -r ../tun2socks-android-jniLibs.zip jniLibs/
+          echo "Archive size: $(du -sh ../tun2socks-android-jniLibs.zip | cut -f1)"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "tun2socks Android ${{ github.ref_name }}"
+          body: |
+            ## tun2socks Android Native Library
+            
+            Build dari: [ambrop72/badvpn](https://github.com/ambrop72/badvpn)
+            
+            ### Fitur
+            - ✅ Support 16KB Page Size (Android 15+)
+            - ✅ NDK ${{ env.NDK_VERSION }}
+            - ✅ API Level ${{ env.API_LEVEL }}+
+            
+            ### ABI yang tersedia
+            - `arm64-v8a` — Android 64-bit (primer)
+            - `armeabi-v7a` — Android 32-bit ARM
+            - `x86_64` — Emulator 64-bit
+            - `x86` — Emulator 32-bit
+            
+            ### Cara pakai di project Android kamu
+            Ekstrak `tun2socks-android-jniLibs.zip` dan taruh folder `jniLibs/` ke `app/src/main/`.
+            
+            ### Verifikasi 16KB alignment
+            ```bash
+            # Cek LOAD segment alignment (harus 0x4000 = 16384)
+            llvm-readelf -l libtun2socks.so | grep -E "LOAD|Align"
+            ```
+          files: |
+            tun2socks-android-jniLibs.zip
+          draft: false
+          prerelease: false
